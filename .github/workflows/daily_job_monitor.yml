@@ -2,16 +2,17 @@ name: Daily Job Monitor
 
 on:
   schedule:
-    # 12:00 PM Nepal Time = 06:15 UTC  (Nepal is UTC+5:45)
+    # 12:00 PM Nepal Time = 06:15 UTC (Nepal is UTC+5:45)
     - cron: "15 6 * * *"
+  workflow_dispatch:   # manual trigger from Actions tab
 
-  # Allow manual trigger from Actions tab for testing
-  workflow_dispatch:
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   run-job-monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     steps:
       - name: Check out repository
@@ -22,27 +23,21 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Cache pip dependencies so installs are fast on repeat runs
-      - name: Cache pip packages
+      - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          key: pip-${{ hashFiles('requirements.txt') }}
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # Restore the SQLite database from the previous run so we never
-      # re-email jobs that were already sent.
-      - name: Restore seen-jobs database
+      - name: Restore jobs database
         uses: actions/cache@v4
         with:
           path: jobs.db
           key: jobs-db-${{ github.run_id }}
-          restore-keys: |
-            jobs-db-
+          restore-keys: jobs-db-
 
       - name: Run job monitor
         env:
@@ -54,9 +49,8 @@ jobs:
           EMAIL_TO:   ${{ secrets.EMAIL_TO }}
         run: python main.py
 
-      # Save the updated DB so tomorrow's run knows what was already sent.
-      - name: Save seen-jobs database
-        if: always()    # save even on partial failure
+      - name: Save jobs database
+        if: always()
         uses: actions/cache/save@v4
         with:
           path: jobs.db
