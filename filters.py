@@ -2,11 +2,11 @@
 filters.py — Job classification with strict location rules.
 
 Inclusion logic:
-  ✓ Onsite + Butwal      → "Butwal Onsite"
-  ✓ Remote + Nepal       → "Nepal Remote"
-  ✗ Remote + Worldwide   → EXCLUDED
-  ✗ Onsite + non-Butwal  → EXCLUDED
-  ✗ Ambiguous            → EXCLUDED (conservative)
+  ✓ Onsite + Butwal             → "Butwal Onsite"
+  ✓ Remote + Nepal              → "Nepal Remote"
+  ✓ Nepal portal + no location  → "Nepal — Verify Location"
+  ✗ Remote + Worldwide          → EXCLUDED
+  ✗ LinkedIn + no Nepal signal  → EXCLUDED
 """
 
 import re
@@ -24,10 +24,6 @@ from config import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Data model
-# ---------------------------------------------------------------------------
-
 @dataclass
 class Job:
     id:               str
@@ -35,19 +31,14 @@ class Job:
     link:             str
     snippet:          str
     source:           str
-    category:         str          # "Butwal Onsite" | "Nepal Remote"
+    category:         str
     score:            float
     matched_keywords: list[str] = field(default_factory=list)
     remote:           bool = False
     location_raw:     str  = ""
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def make_job_id(link: str, title: str) -> str:
-    """Stable 16-char SHA-1 prefix from URL path (or title fallback)."""
     from urllib.parse import urlparse
     if link:
         p = urlparse(link.strip().lower())
@@ -82,11 +73,6 @@ def _detect_nepal(title: str, snippet: str) -> bool:
 
 
 def _role_score(title: str, snippet: str) -> tuple[float, list[str]]:
-    """
-    Returns (score, matched_keywords).
-    Title match = 2 pts, snippet-only match = 1 pt.
-    Score >= 1.0 required to pass.
-    """
     title_text = _lower(title)
     full_text  = _lower(title, snippet)
     score      = 0.0
@@ -123,10 +109,6 @@ def _best_location_string(title: str, snippet: str) -> str:
     return ""
 
 
-# ---------------------------------------------------------------------------
-# Main classifier
-# ---------------------------------------------------------------------------
-
 def classify(
     title:        str,
     link:         str,
@@ -134,51 +116,46 @@ def classify(
     source:       str,
     nepal_source: bool = False,
 ) -> Optional[Job]:
-    """
-    Returns a Job if it passes all filters, otherwise None.
-
-    `nepal_source=True` should be set for all Nepal-specific portals
-    (MeroJob, JobsNepal, etc.).  This allows us to trust that a "remote"
-    job on those sites is Nepal-eligible without an explicit Nepal mention
-    in the text.  For LinkedIn, leave it False (stricter).
-    """
     title   = title.strip()
     snippet = re.sub(r"\s+", " ", snippet.strip())[:400]
 
     if not title or not link:
         return None
 
-    # Hard title exclusions first (fast path)
     if _title_excluded(title):
         return None
 
-    # Role relevance scoring
     score, matched = _role_score(title, snippet)
     if score < 1.0:
         return None
 
-    # Location signals
     is_remote    = _detect_remote(title, snippet)
     is_worldwide = _detect_worldwide(title, snippet)
     is_butwal    = _detect_butwal(title, snippet)
     is_nepal     = _detect_nepal(title, snippet) or nepal_source
 
     # -----------------------------------------------------------------------
-    # Strict location gate
+    # Location gate
     # -----------------------------------------------------------------------
+    if is_worldwide:
+        return None                        # worldwide → always reject
+
     if is_remote:
-        if is_worldwide:
-            return None                   # worldwide remote → reject
         if is_nepal:
             category = "Nepal Remote"
         else:
-            return None                   # remote but no Nepal signal → reject
+            return None                    # remote but no Nepal signal → reject
+
+    elif is_butwal:
+        category = "Butwal Onsite"
+
+    elif nepal_source:
+        # Nepal-specific portal but no location in card text.
+        # Include so Prativa gets the lead — verify location before applying.
+        category = "Nepal — Verify Location"
+
     else:
-        # Onsite (or ambiguous — treat as onsite)
-        if is_butwal:
-            category = "Butwal Onsite"
-        else:
-            return None                   # onsite non-Butwal → reject
+        return None                        # LinkedIn with no clear location → reject
 
     return Job(
         id=make_job_id(link, title),
