@@ -12,7 +12,7 @@ Searches 10 Nepal job portals and LinkedIn every day at **12:00 PM Nepal time** 
 |---|---|
 | Onsite in **Butwal** | Yes— **Butwal Onsite** |
 | Remote, Nepal-eligible |  Yes — **Nepal Remote** |
-| Onsite outside Butwal (e.g. Kathmandu) | ❌ No |
+| Onsite outside Butwal (e.g. Kathmandu) |  No |
 | Worldwide remote |  No |
 | Ambiguous location |  No (conservative) |
 
