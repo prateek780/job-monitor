@@ -108,15 +108,7 @@ NEPAL_SITES: tuple[SiteConfig, ...] = (
         ),
         source_key="necojobs.com.np",
     ),
-    SiteConfig(
-        name="RamroJob",
-        base_url="https://ramrojob.com",
-        url_patterns=(
-            "https://ramrojob.com/jobs?search={q}",
-            "https://ramrojob.com/?s={q}",
-        ),
-        source_key="ramrojob.com",
-    ),
+
     SiteConfig(
         name="JobsDynamics",
         base_url="https://jobsdynamics.com",
