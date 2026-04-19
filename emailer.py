@@ -28,13 +28,15 @@ _SOURCE_NAMES: dict[str, str] = {
     "jobsdynamics.com": "Jobs Dynamics",
     "linkedin.com":     "LinkedIn",
 }
-
-CATEGORY_ORDER = ["Butwal Onsite", "Nepal Remote"]
+CATEGORY_ORDER = ["Butwal Onsite", "Nepal Remote", "Nepal — Verify Location"]
 
 CATEGORY_META: dict[str, dict] = {
-    "Butwal Onsite": {"icon": "📍", "color": "#1d4ed8", "bg": "#dbeafe"},
-    "Nepal Remote":  {"icon": "🌏", "color": "#065f46", "bg": "#d1fae5"},
+    "Butwal Onsite":           {"icon": "📍", "color": "#1d4ed8", "bg": "#dbeafe"},
+    "Nepal Remote":            {"icon": "🌏", "color": "#065f46", "bg": "#d1fae5"},
+    "Nepal — Verify Location": {"icon": "🔍", "color": "#92400e", "bg": "#fef3c7"},
 }
+
+
 
 
 def _friendly_source(raw: str) -> str:
