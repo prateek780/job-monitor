@@ -1,24 +1,27 @@
 """
-sources/nepal_sites.py — Scrapers for all 10 Nepal job portals.
+sources/nepal_sites.py — Nepal job portals.
 
-Each portal is described by a SiteConfig.  A single generic function
-(_scrape_site) handles fetching + parsing for all of them.
+Two strategies per site:
+  1. Targeted keyword searches (multiple terms × URL patterns)
+  2. Browse all-recent listing pages (better recall)
 
-nepal_source=True is passed to filters.classify() for every portal here,
-meaning a job tagged "remote" on these sites is treated as Nepal-eligible
-without needing an explicit "Nepal" mention in the text.
+nepal_source=True is always passed to filters.classify() so jobs
+without explicit location become "Nepal — Verify Location" rather
+than being excluded entirely.
 """
 
 import time
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import quote_plus
 
 from bs4 import BeautifulSoup
 
-from config import HEADERS, SCRAPE_DELAY, SEARCH_TERMS, log
+from config import SEARCH_TERMS, SCRAPE_DELAY
 from filters import Job, classify
-from sources.base import get_with_retry, parse_job_links
+from sources.base import make_session, get_with_retry, extract_job_links
+from storage import record_source_success, record_source_failure
+from utils import is_fuzzy_duplicate
 
 _log = logging.getLogger("job-monitor.nepal")
 
@@ -29,132 +32,172 @@ _log = logging.getLogger("job-monitor.nepal")
 
 @dataclass(frozen=True)
 class SiteConfig:
-    name:         str
-    base_url:     str
-    url_patterns: tuple[str, ...]   # each may contain {q} placeholder
-    source_key:   str               # short label used in emails
+    name:            str
+    base_url:        str
+    source_key:      str
+    search_patterns: tuple[str, ...]
+    browse_urls:     tuple[str, ...] = field(default_factory=tuple)
 
 
 NEPAL_SITES: tuple[SiteConfig, ...] = (
     SiteConfig(
-        name="MeroJob",
-        base_url="https://merojob.com",
-        url_patterns=(
+        name="MeroJob", base_url="https://merojob.com", source_key="merojob.com",
+        search_patterns=(
             "https://merojob.com/search/?q={q}",
             "https://merojob.com/jobs/?s={q}",
         ),
-        source_key="merojob.com",
+        browse_urls=(
+            "https://merojob.com/jobs/",
+            "https://merojob.com/jobs/?page=2",
+        ),
     ),
     SiteConfig(
-        name="JobsNepal",
-        base_url="https://www.jobsnepal.com",
-        url_patterns=(
+        name="JobsNepal", base_url="https://www.jobsnepal.com", source_key="jobsnepal.com",
+        search_patterns=(
             "https://www.jobsnepal.com/search-jobs/?search_keyword={q}",
             "https://www.jobsnepal.com/search/?q={q}",
         ),
-        source_key="jobsnepal.com",
+        browse_urls=(
+            "https://www.jobsnepal.com/",
+            "https://www.jobsnepal.com/jobs/",
+        ),
     ),
     SiteConfig(
-        name="KumariJob",
-        base_url="https://kumarijob.com",
-        url_patterns=(
+        name="KumariJob", base_url="https://kumarijob.com", source_key="kumarijob.com",
+        search_patterns=(
             "https://kumarijob.com/search-jobs/?q={q}",
             "https://kumarijob.com/search/?q={q}",
         ),
-        source_key="kumarijob.com",
+        browse_urls=(
+            "https://kumarijob.com/",
+            "https://kumarijob.com/jobs/",
+        ),
     ),
     SiteConfig(
-        name="Jobejee",
-        base_url="https://www.jobejee.com",
-        url_patterns=(
+        name="Jobejee", base_url="https://www.jobejee.com", source_key="jobejee.com",
+        search_patterns=(
             "https://www.jobejee.com/job-search?q={q}",
             "https://www.jobejee.com/jobs?keyword={q}",
         ),
-        source_key="jobejee.com",
+        browse_urls=(
+            "https://www.jobejee.com/jobs",
+        ),
     ),
     SiteConfig(
-        name="KantipurJob",
-        base_url="https://kantipurjob.com",
-        url_patterns=(
+        name="KantipurJob", base_url="https://kantipurjob.com", source_key="kantipurjob.com",
+        search_patterns=(
             "https://kantipurjob.com/jobs?search={q}",
             "https://kantipurjob.com/search?q={q}",
         ),
-        source_key="kantipurjob.com",
+        browse_urls=(
+            "https://kantipurjob.com/jobs",
+        ),
     ),
     SiteConfig(
-        name="JobAxle",
-        base_url="https://jobaxle.com",
-        url_patterns=(
+        name="JobAxle", base_url="https://jobaxle.com", source_key="jobaxle.com",
+        search_patterns=(
             "https://jobaxle.com/jobs?search={q}",
             "https://jobaxle.com/search?q={q}",
         ),
-        source_key="jobaxle.com",
+        browse_urls=(
+            "https://jobaxle.com/jobs",
+        ),
     ),
     SiteConfig(
-        name="MeroRojgari",
-        base_url="https://merorojgari.com",
-        url_patterns=(
+        name="MeroRojgari", base_url="https://merorojgari.com", source_key="merorojgari.com",
+        search_patterns=(
             "https://merorojgari.com/jobs?search={q}",
             "https://merorojgari.com/?s={q}",
         ),
-        source_key="merorojgari.com",
+        browse_urls=(
+            "https://merorojgari.com/jobs",
+            "https://merorojgari.com/",
+        ),
     ),
     SiteConfig(
-        name="NecoJobs",
-        base_url="https://www.necojobs.com.np",
-        url_patterns=(
+        name="NecoJobs", base_url="https://www.necojobs.com.np", source_key="necojobs.com.np",
+        search_patterns=(
             "https://www.necojobs.com.np/search-jobs/?search_keyword={q}",
             "https://www.necojobs.com.np/search/?q={q}",
         ),
-        source_key="necojobs.com.np",
+        browse_urls=(
+            "https://www.necojobs.com.np/",
+            "https://www.necojobs.com.np/jobs/",
+        ),
     ),
-
     SiteConfig(
-        name="JobsDynamics",
-        base_url="https://jobsdynamics.com",
-        url_patterns=(
+        name="JobsDynamics", base_url="https://jobsdynamics.com", source_key="jobsdynamics.com",
+        search_patterns=(
             "https://jobsdynamics.com/jobs?search={q}",
             "https://jobsdynamics.com/?s={q}",
         ),
-        source_key="jobsdynamics.com",
+        browse_urls=(
+            "https://jobsdynamics.com/jobs",
+            "https://jobsdynamics.com/",
+        ),
     ),
 )
 
 
 # ---------------------------------------------------------------------------
-# Generic scraper
+# Helpers
 # ---------------------------------------------------------------------------
 
-def _scrape_site(site: SiteConfig, term: str) -> list[Job]:
-    """Fetch one search term from one portal. Returns filtered Job list."""
-    q    = quote_plus(term)
+def _parse_url(url: str, site: SiteConfig, session, seen_hrefs: set) -> list[Job]:
+    r = get_with_retry(url, session=session)
+    if r is None:
+        return []
+    soup  = BeautifulSoup(r.text, "html.parser")
+    links = extract_job_links(soup, site.base_url)
     jobs: list[Job] = []
-
-    for pattern in site.url_patterns:
-        url = pattern.format(q=q)
-        r   = get_with_retry(url, headers=HEADERS)
-        if r is None:
-            _log.debug(f"{site.name}: no response for {url}")
+    for title, href, context in links:
+        if href in seen_hrefs:
             continue
-
-        soup  = BeautifulSoup(r.text, "html.parser")
-        links = parse_job_links(soup, site.base_url)
-
-        for title, href, context in links:
-            job = classify(
-                title=title,
-                link=href,
-                snippet=context,
-                source=site.source_key,
-                nepal_source=True,          # all Nepal portals are trusted Nepal sources
-            )
-            if job:
-                jobs.append(job)
-
-        _log.debug(f"{site.name} [{term}]: {url} → {len(jobs)} passing")
-        break  # first working URL wins; don't double-count
-
+        seen_hrefs.add(href)
+        job = classify(title=title, link=href, snippet=context,
+                       source=site.source_key, nepal_source=True)
+        if job:
+            jobs.append(job)
     return jobs
+
+
+def _merge(new: list[Job], pool: list[Job], seen_ids: set) -> None:
+    for job in new:
+        if job.id in seen_ids:
+            continue
+        if any(is_fuzzy_duplicate(job.title, j.title) for j in pool[-60:]):
+            continue
+        seen_ids.add(job.id)
+        pool.append(job)
+
+
+# ---------------------------------------------------------------------------
+# Site scraper
+# ---------------------------------------------------------------------------
+
+def _scrape_site(site: SiteConfig) -> list[Job]:
+    session     = make_session()
+    all_jobs:   list[Job] = []
+    seen_ids:   set[str]  = set()
+    seen_hrefs: set[str]  = set()
+
+    # Strategy 1 — keyword searches
+    for term in SEARCH_TERMS:
+        q = quote_plus(term)
+        for pattern in site.search_patterns:
+            jobs = _parse_url(pattern.format(q=q), site, session, seen_hrefs)
+            _merge(jobs, all_jobs, seen_ids)
+            if jobs:
+                break   # first working URL wins for this term
+        time.sleep(SCRAPE_DELAY)
+
+    # Strategy 2 — browse all-recent
+    for url in site.browse_urls:
+        jobs = _parse_url(url, site, session, seen_hrefs)
+        _merge(jobs, all_jobs, seen_ids)
+        time.sleep(SCRAPE_DELAY)
+
+    return all_jobs
 
 
 # ---------------------------------------------------------------------------
@@ -162,33 +205,22 @@ def _scrape_site(site: SiteConfig, term: str) -> list[Job]:
 # ---------------------------------------------------------------------------
 
 def fetch_all_nepal_sites() -> list[Job]:
-    """
-    Run every (site × search_term) combination.
-    Deduplicates by job ID before returning.
-    Catches and logs exceptions per-site so one broken portal never
-    stops the rest.
-    """
-    all_jobs: list[Job] = []
-    seen_ids: set[str]  = set()
+    all_jobs:    list[Job] = []
+    global_seen: set[str]  = set()
 
     for site in NEPAL_SITES:
-        site_jobs: list[Job] = []
         try:
-            for term in SEARCH_TERMS:
-                try:
-                    for job in _scrape_site(site, term):
-                        if job.id not in seen_ids:
-                            seen_ids.add(job.id)
-                            site_jobs.append(job)
-                except Exception as e:
-                    _log.error(f"{site.name} [{term}]: unexpected error: {e}")
-                time.sleep(SCRAPE_DELAY)
-
+            site_jobs = _scrape_site(site)
+            new: list[Job] = []
+            for job in site_jobs:
+                if job.id not in global_seen:
+                    global_seen.add(job.id)
+                    new.append(job)
+            all_jobs.extend(new)
+            record_source_success(site.source_key, len(new))
+            _log.info(f"{site.name}: {len(new)} relevant jobs")
         except Exception as e:
-            _log.error(f"{site.name}: fatal error, skipping site: {e}")
-            continue
-
-        all_jobs.extend(site_jobs)
-        _log.info(f"{site.name}: {len(site_jobs)} relevant jobs")
+            _log.error(f"{site.name}: fatal, skipping: {e}")
+            record_source_failure(site.source_key)
 
     return all_jobs
