@@ -1,14 +1,16 @@
 """
-sources/linkedin.py — LinkedIn public guest API (no login required).
+sources/linkedin.py — LinkedIn public guest API.
 
-Searches three location contexts:
-  1. "Butwal, Lumbini Province, Nepal"  → category Butwal Onsite (if matching)
-  2. "Nepal"                             → remote-only unless explicitly Butwal
-  3. "Remote"                            → Nepal Remote (only if Nepal signal present)
+Improvements over v1:
+  - 20+ role keywords
+  - 3 location contexts (Butwal, Nepal, Remote)
+  - Pagination: 3 pages per query (offsets 0, 25, 50)
+  - Separate remote-only search with f_WT=2 filter
+  - Robust card parsing with multiple fallback selectors
+  - Rate-limit aware with 429 backoff
 
-nepal_source=False here — we require explicit Nepal/Butwal signals in the
-card text because LinkedIn indexes worldwide jobs and is less trustworthy
-about geography than Nepal-specific portals.
+nepal_source=False: LinkedIn indexes worldwide jobs so we require explicit
+Nepal/Butwal signals in the card text, unlike Nepal-specific portals.
 """
 
 import re
@@ -16,18 +18,20 @@ import time
 import logging
 from urllib.parse import quote_plus
 
-import requests
 from bs4 import BeautifulSoup
 
-from config import REQUEST_TIMEOUT, log
+from config import (
+    LINKEDIN_KEYWORDS, LINKEDIN_LOCATIONS, LINKEDIN_PAGE_OFFSETS,
+    LINKEDIN_DELAY, REQUEST_TIMEOUT,
+)
 from filters import Job, classify
 from sources.base import get_with_retry
+from storage import record_source_success, record_source_failure
+from utils import is_fuzzy_duplicate
 
 _log = logging.getLogger("job-monitor.linkedin")
 
-_BASE_URL = (
-    "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
-)
+_BASE = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
 
 _LI_HEADERS = {
     "User-Agent": (
@@ -40,83 +44,76 @@ _LI_HEADERS = {
     "Referer": "https://www.linkedin.com/",
 }
 
-# (location string sent to API, human label)
-_LOCATIONS: tuple[tuple[str, str], ...] = (
-    ("Butwal, Lumbini Province, Nepal", "Butwal"),
-    ("Nepal",                            "Nepal"),
-    ("Remote",                           "Remote"),
-)
-
-_KEYWORDS: tuple[str, ...] = (
-    "receptionist",
-    "customer service",
-    "front desk",
-    "admin assistant",
-    "data entry",
-    "call center",
-    "office assistant",
-    "cashier",
-    "accounts coordinator",
-)
-
-_INTER_REQUEST_DELAY = 3.0    # LinkedIn rate-limits hard; be polite
+_SOURCE_KEY = "linkedin.com"
 
 
 # ---------------------------------------------------------------------------
 # Fetch raw cards from LinkedIn guest API
 # ---------------------------------------------------------------------------
 
-def _fetch_cards(keyword: str, location: str, start: int = 0) -> list:
+def _fetch_cards(keyword: str, location: str, start: int = 0, remote_only: bool = False) -> list:
     """
-    Calls the LinkedIn guest jobs API and returns a list of BeautifulSoup
-    card elements.  Returns [] on any error.
+    Calls LinkedIn public guest jobs search and returns BeautifulSoup card elements.
     """
-    url = (
-        f"{_BASE_URL}"
+    params = (
         f"?keywords={quote_plus(keyword)}"
         f"&location={quote_plus(location)}"
         f"&start={start}"
-        "&f_TPR=r86400"    # posted in last 24 h
+        "&f_TPR=r86400"   # posted in last 24 hours
     )
-    r = get_with_retry(url, headers=_LI_HEADERS, timeout=REQUEST_TIMEOUT, retries=2)
+    if remote_only:
+        params += "&f_WT=2"  # work type = remote
+
+    url = _BASE + params
+    r   = get_with_retry(url, extra_headers=_LI_HEADERS, timeout=REQUEST_TIMEOUT, retries=2)
     if r is None:
         return []
+
     soup = BeautifulSoup(r.text, "html.parser")
     return soup.find_all("div", class_=re.compile(r"base-card"))
 
 
 # ---------------------------------------------------------------------------
-# Parse a single card div
+# Parse one job card
 # ---------------------------------------------------------------------------
 
-def _parse_card(card, loc_label: str) -> dict | None:
-    """Return raw (title, link, snippet) or None if unparseable."""
+def _parse_card(card, loc_label: str) -> tuple[str, str, str] | None:
+    """Returns (title, link, snippet) or None."""
     try:
-        title_tag = card.find(
-            ["h3", "span"],
-            class_=re.compile(r"base-search-card__title"),
+        # Title
+        title_tag = (
+            card.find(["h3", "span"], class_=re.compile(r"base-search-card__title"))
+            or card.find(["h3", "h2", "h4"])
         )
         title = title_tag.get_text(strip=True) if title_tag else ""
 
-        link_tag = card.find("a", class_=re.compile(r"base-card__full-link"))
-        if not link_tag:
-            link_tag = card.find("a", href=True)
-        link = (link_tag.get("href") or "").split("?")[0].strip() if link_tag else ""
+        # Link
+        link_tag = (
+            card.find("a", class_=re.compile(r"base-card__full-link"))
+            or card.find("a", href=re.compile(r"linkedin\.com/jobs/view"))
+            or card.find("a", href=True)
+        )
+        link = ""
+        if link_tag:
+            link = (link_tag.get("href") or "").split("?")[0].strip()
 
+        # Company
         company_tag = card.find(
-            ["h4", "span"],
+            ["h4", "span", "a"],
             class_=re.compile(r"base-search-card__subtitle"),
         )
         company = company_tag.get_text(strip=True) if company_tag else ""
 
-        loc_tag = card.find(
-            "span",
-            class_=re.compile(r"job-search-card__location"),
-        )
+        # Location
+        loc_tag = card.find("span", class_=re.compile(r"job-search-card__location"))
         loc_text = loc_tag.get_text(strip=True) if loc_tag else loc_label
 
         snippet = f"{company} · {loc_text}".strip(" ·")
-        return {"title": title, "link": link, "snippet": snippet}
+
+        if not title or not link:
+            return None
+        return title, link, snippet
+
     except Exception as e:
         _log.debug(f"Card parse error: {e}")
         return None
@@ -128,42 +125,76 @@ def _parse_card(card, loc_label: str) -> dict | None:
 
 def fetch_linkedin() -> list[Job]:
     """
-    Search LinkedIn for all (keyword × location) combinations.
-    Strict: nepal_source=False — only includes jobs where the card text
-    itself contains clear Nepal/Butwal or remote-Nepal signals.
+    Search LinkedIn for (keyword × location × page) combinations.
+    Also runs a dedicated remote-only search for Nepal to maximise recall.
     """
-    all_jobs: list[Job] = []
-    seen_ids: set[str]  = set()
+    all_jobs:   list[Job] = []
+    seen_ids:   set[str]  = set()
+    total_cards            = 0
+    blocked                = False
 
-    for location, loc_label in _LOCATIONS:
-        for keyword in _KEYWORDS:
-            try:
-                cards = _fetch_cards(keyword, location)
-                _log.debug(
-                    f"LinkedIn [{loc_label}] '{keyword}': {len(cards)} cards"
-                )
+    for location, loc_label in LINKEDIN_LOCATIONS:
+        for keyword in LINKEDIN_KEYWORDS:
+            for offset in LINKEDIN_PAGE_OFFSETS:
+                if blocked:
+                    break
+                cards = _fetch_cards(keyword, location, start=offset)
+                if not cards and offset == 0:
+                    pass   # no results for this query — normal
+                total_cards += len(cards)
+                _log.debug(f"[{loc_label}] '{keyword}' start={offset}: {len(cards)} cards")
+
                 for card in cards:
-                    raw = _parse_card(card, loc_label)
-                    if not raw:
+                    parsed = _parse_card(card, loc_label)
+                    if not parsed:
                         continue
-
+                    title, link, snippet = parsed
                     job = classify(
-                        title=raw["title"],
-                        link=raw["link"],
-                        snippet=raw["snippet"],
-                        source="linkedin.com",
-                        nepal_source=False,     # stricter for LinkedIn
+                        title=title,
+                        link=link,
+                        snippet=snippet,
+                        source=_SOURCE_KEY,
+                        nepal_source=False,
                     )
                     if job and job.id not in seen_ids:
+                        if not any(is_fuzzy_duplicate(job.title, j.title) for j in all_jobs[-40:]):
+                            seen_ids.add(job.id)
+                            all_jobs.append(job)
+
+                time.sleep(LINKEDIN_DELAY)
+
+            if blocked:
+                break
+
+    # Extra pass: remote-only search for Nepal (f_WT=2 filter)
+    if not blocked:
+        for keyword in LINKEDIN_KEYWORDS[:10]:   # top 10 keywords only
+            cards = _fetch_cards(keyword, "Nepal", start=0, remote_only=True)
+            total_cards += len(cards)
+            for card in cards:
+                parsed = _parse_card(card, "Nepal")
+                if not parsed:
+                    continue
+                title, link, snippet = parsed
+                job = classify(
+                    title=title,
+                    link=link,
+                    snippet=snippet,
+                    source=_SOURCE_KEY,
+                    nepal_source=False,
+                )
+                if job and job.id not in seen_ids:
+                    if not any(is_fuzzy_duplicate(job.title, j.title) for j in all_jobs[-40:]):
                         seen_ids.add(job.id)
                         all_jobs.append(job)
+            time.sleep(LINKEDIN_DELAY)
 
-            except Exception as e:
-                _log.error(
-                    f"LinkedIn [{loc_label}] '{keyword}': unexpected error: {e}"
-                )
+    _log.info(
+        f"LinkedIn: {total_cards} cards scanned → {len(all_jobs)} relevant jobs"
+    )
+    if all_jobs:
+        record_source_success(_SOURCE_KEY, len(all_jobs))
+    else:
+        record_source_failure(_SOURCE_KEY)
 
-            time.sleep(_INTER_REQUEST_DELAY)
-
-    _log.info(f"LinkedIn: {len(all_jobs)} relevant jobs")
     return all_jobs
